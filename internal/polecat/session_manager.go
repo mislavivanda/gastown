@@ -2,6 +2,7 @@
 package polecat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/sandbox"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -32,17 +34,56 @@ var (
 )
 
 // SessionManager handles polecat session lifecycle.
+// It supports both local (tmux) and remote (Daytona) execution backends.
 type SessionManager struct {
-	tmux *tmux.Tmux
-	rig  *rig.Rig
+	tmux    *tmux.Tmux
+	rig     *rig.Rig
+	backend sandbox.Backend // Optional: if set, uses backend abstraction
+
+	// activeSessions tracks sandbox sessions for remote backends.
+	// Key: polecat name, Value: sandbox session
+	activeSessions map[string]*sandbox.Session
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
+// Uses local (tmux) backend by default.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	return &SessionManager{
-		tmux: t,
-		rig:  r,
+		tmux:           t,
+		rig:            r,
+		activeSessions: make(map[string]*sandbox.Session),
 	}
+}
+
+// NewSessionManagerWithBackend creates a session manager with a specific backend.
+// For local backend, the tmux parameter is used as fallback for advanced operations.
+// For remote backends (Daytona), tmux is only used for local operations if needed.
+func NewSessionManagerWithBackend(t *tmux.Tmux, r *rig.Rig, backend sandbox.Backend) *SessionManager {
+	return &SessionManager{
+		tmux:           t,
+		rig:            r,
+		backend:        backend,
+		activeSessions: make(map[string]*sandbox.Session),
+	}
+}
+
+// SetBackend sets the execution backend for this session manager.
+// If nil, falls back to direct tmux operations.
+func (m *SessionManager) SetBackend(backend sandbox.Backend) {
+	m.backend = backend
+}
+
+// Backend returns the current execution backend, or nil if using direct tmux.
+func (m *SessionManager) Backend() sandbox.Backend {
+	return m.backend
+}
+
+// IsRemoteBackend returns true if using a remote execution backend (not local tmux).
+func (m *SessionManager) IsRemoteBackend() bool {
+	if m.backend == nil {
+		return false
+	}
+	return m.backend.Type() != sandbox.BackendLocal
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -69,7 +110,7 @@ type SessionInfo struct {
 	// Polecat is the polecat name.
 	Polecat string `json:"polecat"`
 
-	// SessionID is the tmux session identifier.
+	// SessionID is the tmux session identifier (local) or sandbox ID (remote).
 	SessionID string `json:"session_id"`
 
 	// Running indicates if the session is currently active.
@@ -78,13 +119,16 @@ type SessionInfo struct {
 	// RigName is the rig this session belongs to.
 	RigName string `json:"rig_name"`
 
-	// Attached indicates if someone is attached to the session.
+	// Backend is the execution backend type ("local" or "daytona").
+	Backend string `json:"backend,omitempty"`
+
+	// Attached indicates if someone is attached to the session (local only).
 	Attached bool `json:"attached,omitempty"`
 
 	// Created is when the session was created.
 	Created time.Time `json:"created,omitempty"`
 
-	// Windows is the number of tmux windows.
+	// Windows is the number of tmux windows (local only).
 	Windows int `json:"windows,omitempty"`
 
 	// LastActivity is when the session last had activity.
@@ -137,7 +181,21 @@ func (m *SessionManager) hasPolecat(polecat string) bool {
 }
 
 // Start creates and starts a new session for a polecat.
+// If a backend is configured, it uses the backend abstraction layer.
+// Otherwise, it uses direct tmux operations (original behavior).
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+	// Route to backend if configured and it's a remote backend
+	if m.IsRemoteBackend() {
+		return m.startWithRemoteBackend(polecat, opts)
+	}
+
+	// Use original tmux-based implementation
+	return m.startLocal(polecat, opts)
+}
+
+// startLocal creates and starts a new local tmux session for a polecat.
+// This is the original implementation using direct tmux operations.
+func (m *SessionManager) startLocal(polecat string, opts SessionStartOptions) error {
 	if !m.hasPolecat(polecat) {
 		return fmt.Errorf("%w: %s", ErrPolecatNotFound, polecat)
 	}
@@ -243,8 +301,108 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	return nil
 }
 
+// startWithRemoteBackend creates and starts a polecat session using a remote backend.
+// This is used for Daytona and other remote execution environments.
+func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStartOptions) error {
+	ctx := context.Background()
+
+	// Determine working directory (for local file operations like beads)
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = m.polecatDir(polecat)
+	}
+
+	// Build session name
+	sessionName := m.SessionName(polecat)
+
+	// Check if already running
+	exists, err := m.backend.HasSession(ctx, sessionName)
+	if err != nil {
+		return fmt.Errorf("checking session: %w", err)
+	}
+	if exists {
+		running, _ := m.backend.IsRunning(ctx, &sandbox.Session{ID: sessionName})
+		if running {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionName)
+		}
+	}
+
+	// Build environment variables
+	townRoot := filepath.Dir(m.rig.Path)
+	beadsDir := filepath.Join(townRoot, ".beads")
+	env := map[string]string{
+		"GT_RIG":           m.rig.Name,
+		"GT_POLECAT":       polecat,
+		"BEADS_DIR":        beadsDir,
+		"BEADS_NO_DAEMON":  "1",
+		"BEADS_AGENT_NAME": fmt.Sprintf("%s/%s", m.rig.Name, polecat),
+	}
+	if opts.ClaudeConfigDir != "" {
+		env["CLAUDE_CONFIG_DIR"] = opts.ClaudeConfigDir
+	}
+
+	// Create sandbox session
+	createOpts := sandbox.CreateOptions{
+		Name:    sessionName,
+		WorkDir: workDir,
+		Env:     env,
+	}
+
+	sandboxSession, err := m.backend.Create(ctx, createOpts)
+	if err != nil {
+		return fmt.Errorf("creating sandbox: %w", err)
+	}
+
+	// Track the session
+	m.activeSessions[polecat] = sandboxSession
+
+	// Hook the issue to the polecat if provided
+	if opts.Issue != "" {
+		agentID := fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat)
+		if err := m.hookIssue(opts.Issue, agentID, workDir); err != nil {
+			fmt.Printf("Warning: could not hook issue %s: %v\n", opts.Issue, err)
+		}
+	}
+
+	// Build startup command
+	command := opts.Command
+	if command == "" {
+		command = config.BuildPolecatStartupCommand(m.rig.Name, polecat, m.rig.Path, "")
+	}
+
+	// Start the agent in the sandbox
+	if err := m.backend.Start(ctx, sandboxSession, command); err != nil {
+		// Clean up on failure
+		_ = m.backend.Destroy(ctx, sandboxSession)
+		delete(m.activeSessions, polecat)
+		return fmt.Errorf("starting agent: %w", err)
+	}
+
+	// Wait for agent to be ready
+	time.Sleep(8 * time.Second)
+
+	// Send propulsion nudge to trigger autonomous work execution
+	time.Sleep(2 * time.Second)
+	if err := m.backend.SendInput(ctx, sandboxSession, session.PropulsionNudge()); err != nil {
+		debugSession("SendInput PropulsionNudge", err)
+	}
+
+	return nil
+}
+
 // Stop terminates a polecat session.
+// If a backend is configured, it uses the backend abstraction layer.
 func (m *SessionManager) Stop(polecat string, force bool) error {
+	// Route to backend if configured and it's a remote backend
+	if m.IsRemoteBackend() {
+		return m.stopWithRemoteBackend(polecat, force)
+	}
+
+	return m.stopLocal(polecat, force)
+}
+
+// stopLocal terminates a local tmux polecat session.
+func (m *SessionManager) stopLocal(polecat string, force bool) error {
 	sessionID := m.SessionName(polecat)
 
 	running, err := m.tmux.HasSession(sessionID)
@@ -276,6 +434,50 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	return nil
 }
 
+// stopWithRemoteBackend terminates a remote sandbox polecat session.
+func (m *SessionManager) stopWithRemoteBackend(polecat string, force bool) error {
+	ctx := context.Background()
+
+	// Get tracked session
+	sandboxSession, ok := m.activeSessions[polecat]
+	if !ok {
+		// Try to find by session name
+		sessionName := m.SessionName(polecat)
+		exists, err := m.backend.HasSession(ctx, sessionName)
+		if err != nil {
+			return fmt.Errorf("checking session: %w", err)
+		}
+		if !exists {
+			return ErrSessionNotFound
+		}
+		sandboxSession = &sandbox.Session{ID: sessionName}
+	}
+
+	// Sync beads before shutdown (non-fatal)
+	if !force {
+		polecatDir := m.polecatDir(polecat)
+		if err := m.syncBeads(polecatDir); err != nil {
+			fmt.Printf("Warning: beads sync failed: %v\n", err)
+		}
+	}
+
+	// Try graceful shutdown first
+	if !force {
+		_ = m.backend.Stop(ctx, sandboxSession)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Destroy the sandbox
+	if err := m.backend.Destroy(ctx, sandboxSession); err != nil {
+		return fmt.Errorf("destroying sandbox: %w", err)
+	}
+
+	// Remove from tracking
+	delete(m.activeSessions, polecat)
+
+	return nil
+}
+
 // syncBeads runs bd sync in the given directory.
 func (m *SessionManager) syncBeads(workDir string) error {
 	cmd := exec.Command("bd", "sync")
@@ -284,13 +486,50 @@ func (m *SessionManager) syncBeads(workDir string) error {
 }
 
 // IsRunning checks if a polecat session is active.
+// If a backend is configured, it uses the backend abstraction layer.
 func (m *SessionManager) IsRunning(polecat string) (bool, error) {
+	// Route to backend if configured and it's a remote backend
+	if m.IsRemoteBackend() {
+		ctx := context.Background()
+		sessionName := m.SessionName(polecat)
+
+		// For remote backends, query the backend directly (source of truth).
+		// First check existence, then check if agent is actually running.
+		exists, err := m.backend.HasSession(ctx, sessionName)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, nil
+		}
+
+		// Session exists - check if agent process is running
+		// Use cached session if available, otherwise create minimal session object
+		session := &sandbox.Session{ID: sessionName}
+		if cached, ok := m.activeSessions[polecat]; ok {
+			session = cached
+		}
+
+		return m.backend.IsRunning(ctx, session)
+	}
+
 	sessionID := m.SessionName(polecat)
 	return m.tmux.HasSession(sessionID)
 }
 
 // Status returns detailed status for a polecat session.
+// If a backend is configured, it uses the backend abstraction layer.
 func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
+	// Route to backend if configured and it's a remote backend
+	if m.IsRemoteBackend() {
+		return m.statusWithRemoteBackend(polecat)
+	}
+
+	return m.statusLocal(polecat)
+}
+
+// statusLocal returns status for a local tmux polecat session.
+func (m *SessionManager) statusLocal(polecat string) (*SessionInfo, error) {
 	sessionID := m.SessionName(polecat)
 
 	running, err := m.tmux.HasSession(sessionID)
@@ -303,6 +542,7 @@ func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 		SessionID: sessionID,
 		Running:   running,
 		RigName:   m.rig.Name,
+		Backend:   string(sandbox.BackendLocal),
 	}
 
 	if !running {
@@ -339,6 +579,60 @@ func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 		}
 	}
 
+	return info, nil
+}
+
+// statusWithRemoteBackend returns status for a remote sandbox polecat session.
+// For remote backends, we query the backend directly rather than relying on
+// in-memory tracking, since sandboxes persist across process restarts.
+func (m *SessionManager) statusWithRemoteBackend(polecat string) (*SessionInfo, error) {
+	ctx := context.Background()
+	sessionName := m.SessionName(polecat)
+
+	info := &SessionInfo{
+		Polecat:   polecat,
+		SessionID: sessionName,
+		Running:   false,
+		RigName:   m.rig.Name,
+		Backend:   string(m.backend.Type()),
+	}
+
+	// For remote backends, always query the backend directly.
+	// Sandboxes persist independently of this process, so in-memory tracking
+	// is only a cache - the backend is the source of truth.
+
+	// First check if session exists in the backend
+	exists, err := m.backend.HasSession(ctx, sessionName)
+	if err != nil {
+		return nil, fmt.Errorf("checking session existence: %w", err)
+	}
+
+	if !exists {
+		// Session doesn't exist in backend
+		// Clean up stale in-memory tracking if present
+		delete(m.activeSessions, polecat)
+		return info, nil
+	}
+
+	// Session exists - check if agent is actually running
+	// Create a minimal session object to query running state
+	session := &sandbox.Session{ID: sessionName}
+
+	// Use cached session if available (has richer metadata like CreatedAt)
+	if cached, ok := m.activeSessions[polecat]; ok {
+		session = cached
+		info.Created = cached.CreatedAt
+	}
+
+	running, err := m.backend.IsRunning(ctx, session)
+	if err != nil {
+		// Session exists but we can't determine running state
+		// Be conservative and report it exists
+		info.Running = true
+		return info, nil
+	}
+
+	info.Running = running
 	return info, nil
 }
 

@@ -1,0 +1,36 @@
+{
+  "$schema": "../schemas/sandbox.schema.json",
+  "_comment": "Example sandbox configuration - copy to settings/sandbox.json to enable",
+
+  "backend": "local",
+
+  "_comment_daytona": "To enable Daytona sandboxes for polecats, set backend to 'daytona' and configure below",
+  "daytona": {
+    "api_key_env": "DAYTONA_API_KEY",
+    "anthropic_api_key_env": "ANTHROPIC_API_KEY",
+    "region": "us-west-2",
+    "snapshot": "",
+    "image": "",
+    "auto_stop_minutes": 30,
+    "auto_delete_minutes": 60,
+    "resources": {
+      "cpu": 2,
+      "memory_mb": 4096,
+      "disk_gb": 20
+    },
+    "pool": {
+      "enabled": false,
+      "min_warm": 0,
+      "max_active": 20
+    }
+  },
+
+  "local": {
+    "tmux_socket_path": ""
+  },
+
+  "_comment_agent_backends": "Override backend for specific agent roles (polecat, witness, refinery, crew)",
+  "agent_backends": {
+    "polecat": "local"
+  }
+}
