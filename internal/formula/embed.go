@@ -9,7 +9,7 @@ import (
 )
 
 // Generate formulas directory from canonical source at .beads/formulas/
-//go:generate sh -c "rm -rf formulas && mkdir -p formulas && cp ../../.beads/formulas/*.formula.toml ../../.beads/formulas/*.formula.json formulas/ 2>/dev/null || cp ../../.beads/formulas/*.formula.toml formulas/"
+//go:generate sh -c "rm -rf formulas && mkdir -p formulas && cp ../../.beads/formulas/*.formula.toml formulas/"
 
 //go:embed formulas/*.formula.toml
 var formulasFS embed.FS
