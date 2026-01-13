@@ -578,6 +578,13 @@ func (b *Beads) Show(id string) (*Issue, error) {
 	return issues[0], nil
 }
 
+// Exists checks if a bead exists without returning full details.
+// Returns true if the bead exists, false otherwise.
+func (b *Beads) Exists(id string) bool {
+	_, err := b.Show(id)
+	return err == nil
+}
+
 // ShowMultiple fetches multiple issues by ID in a single bd call.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
@@ -1115,7 +1122,25 @@ func ParseAgentFields(description string) *AgentFields {
 // The ID format is: <prefix>-<rig>-<role>-<name> (e.g., gt-gastown-polecat-Toast)
 // Use AgentBeadID() helper to generate correct IDs.
 // The created_by field is populated from BD_ACTOR env var for provenance tracking.
+//
+// IMPORTANT (gt-6gp fix): If hook_bead is specified but does not exist, this function
+// will clear it from the fields to avoid embedding invalid references in the description.
+// This prevents polecats from spawning with non-existent hook_bead values.
 func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, error) {
+	// Validate hook_bead exists BEFORE embedding in description (gt-6gp fix).
+	// If the hook_bead doesn't exist, clear it from fields to avoid embedding
+	// an invalid reference that will confuse the polecat at startup.
+	validatedHookBead := ""
+	if fields != nil && fields.HookBead != "" {
+		if b.Exists(fields.HookBead) {
+			validatedHookBead = fields.HookBead
+		} else {
+			fmt.Printf("Warning: hook_bead '%s' does not exist in beads database, clearing from agent bead (gt-6gp)\n", fields.HookBead)
+			// Clear from fields so FormatAgentDescription won't embed invalid data
+			fields.HookBead = ""
+		}
+	}
+
 	description := FormatAgentDescription(title, fields)
 
 	args := []string{"create", "--json",
@@ -1144,17 +1169,18 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	if fields != nil && fields.RoleBead != "" {
 		if _, err := b.run("slot", "set", id, "role", fields.RoleBead); err != nil {
 			// Non-fatal: warn but continue
-			fmt.Printf("Warning: could not set role slot: %v\n", err)
+			fmt.Printf("Warning: could not set role slot for %s: %v\n", id, err)
 		}
 	}
 
-	// Set the hook slot if specified (this is the authoritative storage)
+	// Set the hook slot if validated above (this is the authoritative storage)
 	// This fixes the slot inconsistency bug where bead status is 'hooked' but
 	// agent's hook slot is empty. See mi-619.
-	if fields != nil && fields.HookBead != "" {
-		if _, err := b.run("slot", "set", id, "hook", fields.HookBead); err != nil {
-			// Non-fatal: warn but continue - description text has the backup
-			fmt.Printf("Warning: could not set hook slot: %v\n", err)
+	// Only attempt if hook_bead was validated to exist (gt-6gp fix).
+	if validatedHookBead != "" {
+		if _, err := b.run("slot", "set", id, "hook", validatedHookBead); err != nil {
+			// Log with more context for debugging (gt-6gp improvement)
+			fmt.Printf("Warning: could not set hook slot for %s -> %s: %v\n", id, validatedHookBead, err)
 		}
 	}
 
