@@ -21,6 +21,6 @@
 
   "_comment_agent_backends": "Override backend for specific agent roles (polecat, witness, refinery, crew)",
   "agent_backends": {
-    "polecat": "local"
+    "polecat": "daytona"
   }
 }

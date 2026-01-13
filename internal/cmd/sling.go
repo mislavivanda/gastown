@@ -231,12 +231,21 @@ func runSling(cmd *cobra.Command, args []string) error {
 			} else {
 				// Spawn a fresh polecat in the rig
 				fmt.Printf("Target is rig '%s', spawning fresh polecat...\n", rigName)
+
+				// Build task prompt for remote backends (Daytona) that can't access local beads
+				var taskPrompt string
+				if info, infoErr := getBeadInfo(beadID); infoErr == nil {
+					taskPrompt = fmt.Sprintf("Work on bead %s: %s", beadID, info.Title)
+				}
+
 				spawnOpts := SlingSpawnOptions{
-					Force:    slingForce,
-					Account:  slingAccount,
-					Create:   slingCreate,
-					HookBead: beadID, // Set atomically at spawn time
-					Agent:    slingAgent,
+					Force:      slingForce,
+					Naked:      slingNaked,
+					Account:    slingAccount,
+					Create:     slingCreate,
+					HookBead:   beadID, // Set atomically at spawn time
+					Agent:      slingAgent,
+					TaskPrompt: taskPrompt,
 				}
 				spawnInfo, spawnErr := SpawnPolecatForSling(rigName, spawnOpts)
 				if spawnErr != nil {

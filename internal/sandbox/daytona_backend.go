@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,9 @@ const (
 	MetaPtyID       = "pty_id"
 	MetaSandboxName = "sandbox_name"
 )
+
+// Path where Start command output is captured.
+const DaytonaOutputLog = "/tmp/daytona-output.log"
 
 // DaytonaBackend implements Backend using Daytona sandboxes.
 // This enables running agents in isolated cloud sandboxes for scalability.
@@ -189,6 +193,9 @@ func (b *DaytonaBackend) Start(ctx context.Context, session *Session, command st
 		return fmt.Errorf("session missing sandbox ID")
 	}
 
+	// Pre-configure Claude settings to skip theme selection dialog
+	b.configureClaudeSettings(ctx, sandboxID)
+
 	// Generate a unique PTY session ID
 	ptyID := fmt.Sprintf("claude-%s-%d", session.ID, time.Now().Unix())
 
@@ -198,6 +205,7 @@ func (b *DaytonaBackend) Start(ctx context.Context, session *Session, command st
 	// Create PTY session with environment variables
 	envs := map[string]string{
 		"TERM": "xterm-256color",
+		"HOME": "/home/daytona",
 	}
 	if anthropicKey != "" {
 		envs["ANTHROPIC_API_KEY"] = anthropicKey
@@ -237,9 +245,13 @@ func (b *DaytonaBackend) Start(ctx context.Context, session *Session, command st
 	b.setPtyHandle(session.ID, ptyHandle)
 
 	// Build the command to execute
+	// Always wrap in script command to capture output to log file for streaming
 	if command == "" {
 		command = "claude --dangerously-skip-permissions"
 	}
+	// Wrap any command with script to capture output to DaytonaOutputLog
+	// The script command records terminal output which readOutput() can then read
+	command = fmt.Sprintf("script -q -f -c '%s' %s", command, DaytonaOutputLog)
 
 	// Send the command to the PTY (with newline to execute)
 	if err := ptyHandle.SendInput(command + "\n"); err != nil {
@@ -249,10 +261,109 @@ func (b *DaytonaBackend) Start(ctx context.Context, session *Session, command st
 		return fmt.Errorf("sending command to PTY: %w", err)
 	}
 
+	// Wait for Claude to start and handle any dialogs (only if running Claude)
+	if strings.Contains(command, "claude") {
+		if err := b.waitForClaudeReady(ctx, sandboxID, ptyHandle); err != nil {
+			return fmt.Errorf("waiting for Claude to be ready: %w", err)
+		}
+	}
+
 	// Note: The PtyHandle.readMessages goroutine started in ConnectPty
 	// handles reading and buffering output automatically
 
 	return nil
+}
+
+// waitForClaudeReady polls the Claude output log and handles interactive dialogs
+// until Claude is fully started and ready to accept input.
+func (b *DaytonaBackend) waitForClaudeReady(ctx context.Context, sandboxID string, ptyHandle *daytona.PtyHandle) error {
+	readOutput := func() string {
+		resp, err := b.client.ExecuteCommand(ctx, sandboxID, &daytona.ExecuteRequest{
+			Command: fmt.Sprintf("sh -c 'cat %s 2>/dev/null || echo [No_output_yet]'", DaytonaOutputLog),
+			Timeout: 10,
+		})
+		if err != nil {
+			return "[error reading output]"
+		}
+		return resp.Result
+	}
+
+	// Track which dialogs we've already handled to prevent re-entering the same dialog.
+	// This is necessary because readOutput() returns the entire log file from the start,
+	// so we need to ensure we only process each dialog once.
+	handledAPIKeyDialog := false
+	handledBypassPermissionsDialog := false
+
+	// Timing constants for waiting and polling
+	const maxWaitTimeSeconds = 30                     // Maximum time to wait for Claude to be ready
+	const delayBetweenDialogs = 2 * time.Second       // Wait time after handling a dialog before checking again
+	const delayAfterKeyPress = 200 * time.Millisecond // Small delay between sending arrow keys and Enter
+
+	for range maxWaitTimeSeconds { // Poll for up to maxWaitTimeSeconds
+		time.Sleep(1 * time.Second)
+
+		output := readOutput()
+		fmt.Printf("Output: %s\n", output)
+
+		// Check for API key confirmation dialog
+		if !handledAPIKeyDialog && (strings.Contains(output, "Detected a custom API key") ||
+			strings.Contains(output, "Do you want to use this API key")) {
+			fmt.Println("*** API KEY CONFIRMATION DIALOG DETECTED ***")
+			// Need to press Up arrow to select "Yes", then Enter to confirm
+			fmt.Println("Sending Up arrow + Enter to select Yes...")
+			if err := ptyHandle.SendInput("\x1b[A"); err != nil { // Up arrow
+				return fmt.Errorf("sending up arrow: %w", err)
+			}
+			time.Sleep(delayAfterKeyPress)
+			if err := ptyHandle.SendInput("\r"); err != nil { // Enter
+				return fmt.Errorf("sending enter: %w", err)
+			}
+			handledAPIKeyDialog = true
+			time.Sleep(delayBetweenDialogs)
+			continue
+		}
+
+		// Check for Bypass Permissions warning dialog
+		if !handledBypassPermissionsDialog && (strings.Contains(output, "Bypass Permissions mode") ||
+			strings.Contains(output, "Yes, I accept")) {
+			fmt.Println("*** BYPASS PERMISSIONS DIALOG DETECTED ***")
+			// Need to press Down arrow to select "Yes, I accept", then Enter
+			fmt.Println("Sending Down arrow + Enter to accept...")
+			if err := ptyHandle.SendInput("\x1b[B"); err != nil { // Down arrow
+				return fmt.Errorf("sending down arrow: %w", err)
+			}
+			time.Sleep(delayAfterKeyPress)
+			if err := ptyHandle.SendInput("\r"); err != nil { // Enter
+				return fmt.Errorf("sending enter: %w", err)
+			}
+			handledBypassPermissionsDialog = true
+			time.Sleep(delayBetweenDialogs)
+			continue
+		}
+
+		// Check if Claude is ready (look for welcome message or prompt)
+		if strings.Contains(output, "Welcome back") || strings.Contains(output, "bypass permissions on") {
+			fmt.Println("Claude is READY!")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for Claude to be ready after %d seconds", maxWaitTimeSeconds)
+}
+
+// configureClaudeSettings creates config files to skip Claude's theme selection dialog.
+func (b *DaytonaBackend) configureClaudeSettings(ctx context.Context, sandboxID string) {
+	// Remove any existing corrupted config
+	b.client.ExecuteCommand(ctx, sandboxID, &daytona.ExecuteRequest{
+		Command: "sh -c 'rm -rf /home/daytona/.claude.json /home/daytona/.claude'",
+		Timeout: 10,
+	})
+
+	// Create .claude directory and config files
+	b.client.ExecuteCommand(ctx, sandboxID, &daytona.ExecuteRequest{
+		Command: `sh -c 'mkdir -p /home/daytona/.claude && printf "{\"hasCompletedOnboarding\":true}\n" > /home/daytona/.claude.json && printf "{\"theme\":\"dark\"}\n" > /home/daytona/.claude/settings.json'`,
+		Timeout: 10,
+	})
 }
 
 // Stop gracefully stops the agent in a sandbox.
@@ -414,7 +525,6 @@ func (b *DaytonaBackend) SendInput(ctx context.Context, session *Session, messag
 		return fmt.Errorf("session is nil")
 	}
 
-	// Get PTY handle for this session
 	handle := b.getPtyHandle(session.ID)
 	if handle == nil {
 		return fmt.Errorf("no PTY connection for session - call Start() first")
@@ -424,9 +534,19 @@ func (b *DaytonaBackend) SendInput(ctx context.Context, session *Session, messag
 		return fmt.Errorf("PTY connection is closed")
 	}
 
-	// Send input via WebSocket (add newline to execute)
+	// Send the message text
 	if err := handle.SendInput(message + "\n"); err != nil {
 		return fmt.Errorf("sending input to PTY: %w", err)
+	}
+
+	// Delay required for Claude Code's TUI to process input before Enter
+	// Shell commands work fine with simpler approaches (message+\r in one call), but the delay doesn't harm them.
+	// Keeping a single consistent approach avoids complexity and works for all cases.
+	time.Sleep(200 * time.Millisecond)
+
+	// Send Enter (\r) separately to submit - Claude Code requires this
+	if err := handle.SendInput("\r"); err != nil {
+		return fmt.Errorf("sending enter to PTY: %w", err)
 	}
 
 	return nil

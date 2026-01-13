@@ -3,6 +3,7 @@ package polecat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/sandbox"
+	"github.com/steveyegge/gastown/internal/sandbox/daytona"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -86,6 +88,80 @@ func (m *SessionManager) IsRemoteBackend() bool {
 	return m.backend.Type() != sandbox.BackendLocal
 }
 
+// persistedSessionState stores Daytona session info on disk for cross-process access.
+type persistedSessionState struct {
+	SessionID string            `json:"session_id"`
+	SandboxID string            `json:"sandbox_id"`
+	PtyID     string            `json:"pty_id"`
+	Backend   string            `json:"backend"`
+	CreatedAt time.Time         `json:"created_at"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+}
+
+// sessionStatePath returns the file path for persisting session state.
+func (m *SessionManager) sessionStatePath(polecat string) string {
+	return filepath.Join(m.rig.Path, ".runtime", "daytona-sessions", polecat+".json")
+}
+
+// saveSessionState persists session metadata to disk for cross-process access.
+func (m *SessionManager) saveSessionState(polecat string, session *sandbox.Session) error {
+	statePath := m.sessionStatePath(polecat)
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(statePath), 0755); err != nil {
+		return fmt.Errorf("creating state directory: %w", err)
+	}
+
+	state := persistedSessionState{
+		SessionID: session.ID,
+		SandboxID: session.Metadata[sandbox.MetaSandboxID],
+		PtyID:     session.Metadata[sandbox.MetaPtyID],
+		Backend:   string(session.Backend),
+		CreatedAt: session.CreatedAt,
+		Metadata:  session.Metadata,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling state: %w", err)
+	}
+
+	if err := os.WriteFile(statePath, data, 0644); err != nil {
+		return fmt.Errorf("writing state file: %w", err)
+	}
+
+	return nil
+}
+
+// loadSessionState loads persisted session state from disk.
+func (m *SessionManager) loadSessionState(polecat string) (*persistedSessionState, error) {
+	statePath := m.sessionStatePath(polecat)
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no persisted session state for %s", polecat)
+		}
+		return nil, fmt.Errorf("reading state file: %w", err)
+	}
+
+	var state persistedSessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("parsing state file: %w", err)
+	}
+
+	return &state, nil
+}
+
+// deleteSessionState removes persisted session state from disk.
+func (m *SessionManager) deleteSessionState(polecat string) error {
+	statePath := m.sessionStatePath(polecat)
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing state file: %w", err)
+	}
+	return nil
+}
+
 // SessionStartOptions configures polecat session startup.
 type SessionStartOptions struct {
 	// WorkDir overrides the default working directory (polecat clone dir).
@@ -103,6 +179,11 @@ type SessionStartOptions struct {
 	// RuntimeConfigDir is resolved config directory for the runtime account.
 	// If set, this is injected as an environment variable.
 	RuntimeConfigDir string
+
+	// TaskPrompt is an optional task description to send directly to the agent.
+	// Used by remote backends (Daytona) where beads are not accessible.
+	// If set, this is sent as the initial prompt instead of propulsion nudge.
+	TaskPrompt string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -344,7 +425,7 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 	// Create sandbox session
 	createOpts := sandbox.CreateOptions{
 		Name:    sessionName,
-		WorkDir: workDir,
+		WorkDir: "/home/daytona",
 		Env:     env,
 	}
 
@@ -378,13 +459,26 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 		return fmt.Errorf("starting agent: %w", err)
 	}
 
-	// Wait for agent to be ready
-	time.Sleep(8 * time.Second)
+	// Persist session state for cross-process access (peek, nudge)
+	if err := m.saveSessionState(polecat, sandboxSession); err != nil {
+		debugSession("saveSessionState", err)
+	}
 
-	// Send propulsion nudge to trigger autonomous work execution
-	time.Sleep(2 * time.Second)
-	if err := m.backend.SendInput(ctx, sandboxSession, session.PropulsionNudge()); err != nil {
-		debugSession("SendInput PropulsionNudge", err)
+	// Wait for agent to be ready
+	time.Sleep(10 * time.Second)
+
+	// Send task prompt or propulsion nudge to start work
+	var prompt string
+	opts.TaskPrompt = "Calculate 4+4"
+	if opts.TaskPrompt != "" {
+		// Use provided task prompt (for remote backends without beads access)
+		prompt = opts.TaskPrompt
+	} else {
+		// Default to propulsion nudge (agent discovers work via gt prime)
+		prompt = session.PropulsionNudge()
+	}
+	if err := m.backend.SendInput(ctx, sandboxSession, prompt); err != nil {
+		debugSession("SendInput prompt", err)
 	}
 
 	return nil
@@ -680,6 +774,11 @@ func (m *SessionManager) Attach(polecat string) error {
 
 // Capture returns the recent output from a polecat session.
 func (m *SessionManager) Capture(polecat string, lines int) (string, error) {
+	// For remote backends, reconnect to PTY and capture live output
+	if m.IsRemoteBackend() {
+		return m.captureRemote(polecat, lines)
+	}
+
 	sessionID := m.SessionName(polecat)
 
 	running, err := m.tmux.HasSession(sessionID)
@@ -691,6 +790,43 @@ func (m *SessionManager) Capture(polecat string, lines int) (string, error) {
 	}
 
 	return m.tmux.CapturePane(sessionID, lines)
+}
+
+// captureRemote captures output from a remote polecat session.
+// Reads from the script log file where Claude output is captured.
+func (m *SessionManager) captureRemote(polecat string, lines int) (string, error) {
+	ctx := context.Background()
+
+	// Load persisted session state
+	state, err := m.loadSessionState(polecat)
+	if err != nil {
+		return "", fmt.Errorf("loading session state: %w", err)
+	}
+
+	// Check if backend supports execution (Daytona)
+	daytonaBackend, ok := m.backend.(*sandbox.DaytonaBackend)
+	if !ok {
+		return "", fmt.Errorf("remote backend does not support command execution")
+	}
+
+	// Get the Daytona client
+	client, err := daytonaBackend.GetClient()
+	if err != nil {
+		return "", fmt.Errorf("getting Daytona client: %w", err)
+	}
+
+	// Read from the script log file where Claude output is captured
+	// Wrap in sh -c to ensure shell operators work correctly
+	cmd := fmt.Sprintf("sh -c 'tail -n %d %s 2>/dev/null || echo \"[No output log yet]\"'", lines, sandbox.DaytonaOutputLog)
+	resp, err := client.ExecuteCommand(ctx, state.SandboxID, &daytona.ExecuteRequest{
+		Command: cmd,
+		Timeout: 60,
+	})
+	if err != nil {
+		return "", fmt.Errorf("reading output log: %w", err)
+	}
+
+	return resp.Result, nil
 }
 
 // CaptureSession returns the recent output from a session by raw session ID.
@@ -708,6 +844,11 @@ func (m *SessionManager) CaptureSession(sessionID string, lines int) (string, er
 
 // Inject sends a message to a polecat session.
 func (m *SessionManager) Inject(polecat, message string) error {
+	// For remote backends, reconnect to PTY and send input
+	if m.IsRemoteBackend() {
+		return m.injectRemote(polecat, message)
+	}
+
 	sessionID := m.SessionName(polecat)
 
 	running, err := m.tmux.HasSession(sessionID)
@@ -724,6 +865,40 @@ func (m *SessionManager) Inject(polecat, message string) error {
 	}
 
 	return m.tmux.SendKeysDebounced(sessionID, message, debounceMs)
+}
+
+// injectRemote sends a message to a remote polecat session via PTY.
+func (m *SessionManager) injectRemote(polecat, message string) error {
+	ctx := context.Background()
+
+	// Load persisted session state
+	state, err := m.loadSessionState(polecat)
+	if err != nil {
+		return fmt.Errorf("loading session state: %w", err)
+	}
+
+	// Check if backend supports Daytona
+	daytonaBackend, ok := m.backend.(*sandbox.DaytonaBackend)
+	if !ok {
+		return fmt.Errorf("remote backend does not support PTY input")
+	}
+
+	// Build session object from persisted state
+	session := &sandbox.Session{
+		ID:      state.SessionID,
+		Backend: sandbox.BackendType(state.Backend),
+		Metadata: map[string]string{
+			sandbox.MetaSandboxID: state.SandboxID,
+			sandbox.MetaPtyID:     state.PtyID,
+		},
+	}
+
+	// Send the message via PTY
+	if err := daytonaBackend.SendInput(ctx, session, message); err != nil {
+		return fmt.Errorf("sending message: %w", err)
+	}
+
+	return nil
 }
 
 // StopAll terminates all polecat sessions for this rig.

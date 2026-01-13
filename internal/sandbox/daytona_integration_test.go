@@ -919,3 +919,63 @@ func TestDaytonaClaudeCode(t *testing.T) {
 	}
 	t.Log("Test completed")
 }
+
+// TestDaytonaClaudePtyStream tests starting Claude via backend.Start() and streaming PTY output.
+// This verifies that Claude starts properly, receives the task and outputs the correct result.
+func TestDaytonaClaudePtyStream(t *testing.T) {
+	skipIfNoAPIKey(t)
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		t.Skip("ANTHROPIC_API_KEY not set, skipping Claude Code test")
+	}
+
+	backend := NewDaytonaBackend(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Create a sandbox
+	t.Log("Creating sandbox...")
+	session, err := backend.Create(ctx, CreateOptions{
+		Name:    "gastown-ptystream-" + time.Now().Format("20060102-150405"),
+		WorkDir: "/home/daytona",
+	})
+	if err != nil {
+		t.Fatalf("Failed to create sandbox: %v", err)
+	}
+	sandboxID := session.Metadata[MetaSandboxID]
+	t.Logf("Created sandbox: %s", sandboxID)
+
+	defer func() {
+		t.Log("Destroying sandbox...")
+		backend.Destroy(context.Background(), session)
+	}()
+
+	// Start Claude via backend.Start() - this uses --dangerously-skip-permissions by default
+	t.Log("Starting Claude via backend.Start()...")
+	if err := backend.Start(ctx, session, ""); err != nil {
+		t.Fatalf("Failed to start Claude: %v", err)
+	}
+	t.Log("Claude started, streaming PTY output...")
+
+	// Send a simple prompt
+	t.Log("Sending prompt to Claude...")
+	if err := backend.SendInput(ctx, session, "What is 2+2? Reply with just the number."); err != nil {
+		t.Fatalf("Failed to send input: %v", err)
+	}
+
+	// Wait and capture response
+	t.Log("Waiting for Claude's response...")
+	time.Sleep(15 * time.Second)
+
+	output, err := backend.CaptureOutput(ctx, session, 200)
+	if err != nil {
+		t.Fatalf("Failed to capture final output: %v", err)
+	}
+	t.Logf("\n=== Final PTY Output ===\n%s\n=== End ===\n", output)
+
+	// Stop Claude
+	t.Log("Stopping Claude...")
+	if err := backend.Stop(ctx, session); err != nil {
+		t.Errorf("Failed to stop: %v", err)
+	}
+	t.Log("Test completed")
+}
