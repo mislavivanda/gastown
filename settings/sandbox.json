@@ -12,7 +12,8 @@
     "auto_delete_minutes": -1,
     "snapshot": "daytona-medium",
     "snapshot_has_claude_code": false,
-    "target": "us"
+    "target": "us",
+    "remote_work_dir": "/home/daytona/gastown-project" 
   },
 
   "local": {

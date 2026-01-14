@@ -387,10 +387,17 @@ func (m *SessionManager) startLocal(polecat string, opts SessionStartOptions) er
 func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStartOptions) error {
 	ctx := context.Background()
 
-	// Determine working directory (for local file operations like beads)
-	workDir := opts.WorkDir
-	if workDir == "" {
-		workDir = m.polecatDir(polecat)
+	// Local polecat worktree directory (source for file sync)
+	localWorkDir := opts.WorkDir
+	if localWorkDir == "" {
+		localWorkDir = m.polecatDir(polecat)
+	}
+
+	// Remote working directory inside sandbox (destination for file sync)
+	// Get from backend config if available, otherwise use default
+	remoteWorkDir := sandbox.DefaultRemoteWorkDir
+	if daytonaBackend, ok := m.backend.(*sandbox.DaytonaBackend); ok {
+		remoteWorkDir = daytonaBackend.RemoteWorkDir()
 	}
 
 	// Build session name
@@ -422,10 +429,10 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 		env["CLAUDE_CONFIG_DIR"] = opts.ClaudeConfigDir
 	}
 
-	// Create sandbox session
+	// Create sandbox session with remote working directory
 	createOpts := sandbox.CreateOptions{
 		Name:    sessionName,
-		WorkDir: "/home/daytona",
+		WorkDir: remoteWorkDir,
 		Env:     env,
 	}
 
@@ -437,10 +444,28 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 	// Track the session
 	m.activeSessions[polecat] = sandboxSession
 
+	// Sync local polecat worktree to sandbox
+	// This copies the entire worktree so the agent has files to work on.
+	// Changes are synced back when the session stops.
+	if syncBackend, ok := m.backend.(sandbox.SyncBackend); ok {
+		fmt.Printf("Syncing worktree to sandbox: %s -> %s\n", localWorkDir, remoteWorkDir)
+		if err := syncBackend.SyncToSession(ctx, sandboxSession, localWorkDir, remoteWorkDir); err != nil {
+			// Clean up on failure
+			_ = m.backend.Destroy(ctx, sandboxSession)
+			delete(m.activeSessions, polecat)
+			return fmt.Errorf("syncing worktree to sandbox: %w", err)
+		}
+		fmt.Printf("✓ Worktree synced to sandbox\n")
+	}
+
+	// Store work dirs in session metadata for sync back later
+	sandboxSession.Metadata["local_work_dir"] = localWorkDir
+	sandboxSession.Metadata["remote_work_dir"] = remoteWorkDir
+
 	// Hook the issue to the polecat if provided
 	if opts.Issue != "" {
 		agentID := fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat)
-		if err := m.hookIssue(opts.Issue, agentID, workDir); err != nil {
+		if err := m.hookIssue(opts.Issue, agentID, localWorkDir); err != nil {
 			fmt.Printf("Warning: could not hook issue %s: %v\n", opts.Issue, err)
 		}
 	}
@@ -469,7 +494,6 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 
 	// Send task prompt or propulsion nudge to start work
 	var prompt string
-	opts.TaskPrompt = "Calculate 4+4"
 	if opts.TaskPrompt != "" {
 		// Use provided task prompt (for remote backends without beads access)
 		prompt = opts.TaskPrompt
@@ -535,7 +559,7 @@ func (m *SessionManager) stopWithRemoteBackend(polecat string, force bool) error
 	// Get tracked session
 	sandboxSession, ok := m.activeSessions[polecat]
 	if !ok {
-		// Try to find by session name
+		// Try to find by session name and load persisted state
 		sessionName := m.SessionName(polecat)
 		exists, err := m.backend.HasSession(ctx, sessionName)
 		if err != nil {
@@ -544,13 +568,51 @@ func (m *SessionManager) stopWithRemoteBackend(polecat string, force bool) error
 		if !exists {
 			return ErrSessionNotFound
 		}
-		sandboxSession = &sandbox.Session{ID: sessionName}
+
+		// Try to load persisted state to get metadata (local_work_dir, sandbox_id, etc.)
+		state, err := m.loadSessionState(polecat)
+		if err != nil {
+			// Create minimal session if state not found
+			sandboxSession = &sandbox.Session{ID: sessionName, Metadata: make(map[string]string)}
+		} else {
+			sandboxSession = &sandbox.Session{
+				ID:       sessionName,
+				Backend:  sandbox.BackendType(state.Backend),
+				Metadata: state.Metadata,
+			}
+		}
+	}
+
+	// Get work directories for sync back (stored in metadata during start)
+	localWorkDir := sandboxSession.Metadata["local_work_dir"]
+	if localWorkDir == "" {
+		localWorkDir = m.polecatDir(polecat)
+	}
+	remoteWorkDir := sandboxSession.Metadata["remote_work_dir"]
+	if remoteWorkDir == "" {
+		// Fallback: get from backend config or use default
+		remoteWorkDir = sandbox.DefaultRemoteWorkDir
+		if daytonaBackend, ok := m.backend.(*sandbox.DaytonaBackend); ok {
+			remoteWorkDir = daytonaBackend.RemoteWorkDir()
+		}
+	}
+
+	// Sync changes from sandbox back to local worktree (non-fatal)
+	// This downloads any file changes the agent made so they appear in the local git worktree.
+	if !force {
+		if syncBackend, ok := m.backend.(sandbox.SyncBackend); ok {
+			fmt.Printf("Syncing changes from sandbox: %s -> %s\n", remoteWorkDir, localWorkDir)
+			if err := syncBackend.SyncFromSession(ctx, sandboxSession, remoteWorkDir, localWorkDir); err != nil {
+				fmt.Printf("Warning: failed to sync changes from sandbox: %v\n", err)
+			} else {
+				fmt.Printf("✓ Changes synced from sandbox\n")
+			}
+		}
 	}
 
 	// Sync beads before shutdown (non-fatal)
 	if !force {
-		polecatDir := m.polecatDir(polecat)
-		if err := m.syncBeads(polecatDir); err != nil {
+		if err := m.syncBeads(localWorkDir); err != nil {
 			fmt.Printf("Warning: beads sync failed: %v\n", err)
 		}
 	}
@@ -566,8 +628,9 @@ func (m *SessionManager) stopWithRemoteBackend(polecat string, force bool) error
 		return fmt.Errorf("destroying sandbox: %w", err)
 	}
 
-	// Remove from tracking
+	// Remove from tracking and clean up persisted state
 	delete(m.activeSessions, polecat)
+	_ = m.deleteSessionState(polecat)
 
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/sandbox"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -235,7 +236,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 				// Build task prompt for remote backends (Daytona) that can't access local beads
 				var taskPrompt string
 				if info, infoErr := getBeadInfo(beadID); infoErr == nil {
-					taskPrompt = fmt.Sprintf("Work on bead %s: %s", beadID, info.Title)
+					taskPrompt = buildTaskPromptForRemote(beadID, info, slingArgs)
 				}
 
 				spawnOpts := SlingSpawnOptions{
@@ -514,4 +515,58 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// getRemoteWorkDir returns the configured remote work directory from sandbox config.
+// Falls back to DefaultRemoteWorkDir if not configured.
+func getRemoteWorkDir() string {
+	// Get workspace root (git repo root = town root)
+	workspaceRoot, err := detectCloneRoot()
+	if err != nil {
+		return sandbox.DefaultRemoteWorkDir
+	}
+
+	// Load sandbox config from workspace root
+	cfg, err := sandbox.LoadConfig(workspaceRoot)
+	if err == nil && cfg.Daytona != nil && cfg.Daytona.RemoteWorkDir != "" {
+		return cfg.Daytona.RemoteWorkDir
+	}
+
+	return sandbox.DefaultRemoteWorkDir
+}
+
+// buildTaskPromptForRemote builds a comprehensive task prompt for remote backends (Daytona).
+// Remote polecats can't access local beads, so we include all necessary context in the prompt.
+// This includes the bead ID, title, full description, working directory, and any attached args.
+func buildTaskPromptForRemote(beadID string, info *beadInfo, args string) string {
+	remoteWorkDir := getRemoteWorkDir()
+	var sb strings.Builder
+
+	fmt.Fprintf(&sb, "## Task: %s\n\n", info.Title)
+	fmt.Fprintf(&sb, "**Bead ID:** %s\n", beadID)
+	fmt.Fprintf(&sb, "**Working Directory:** %s\n", remoteWorkDir)
+
+	if len(info.Labels) > 0 {
+		fmt.Fprintf(&sb, "**Labels:** %s\n", strings.Join(info.Labels, ", "))
+	}
+
+	sb.WriteString("\n### Description\n\n")
+	if info.Description != "" {
+		sb.WriteString(info.Description)
+	} else {
+		sb.WriteString("(No description provided)")
+	}
+
+	if args != "" {
+		fmt.Fprintf(&sb, "\n\n### Instructions\n\n%s", args)
+	}
+
+	sb.WriteString("\n\n---\n")
+	sb.WriteString("Complete this task. When done, summarize what you accomplished.\n\n")
+	sb.WriteString("**Environment:**\n")
+	fmt.Fprintf(&sb, "- You are running in a remote sandbox\n")
+	fmt.Fprintf(&sb, "- The project code has been synced to `%s` - work inside this directory\n", remoteWorkDir)
+	sb.WriteString("- You do not have access to gt/bd commands\n")
+
+	return sb.String()
 }

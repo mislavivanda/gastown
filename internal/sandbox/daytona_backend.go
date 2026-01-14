@@ -851,6 +851,15 @@ func (b *DaytonaBackend) GetClient() (*daytona.Client, error) {
 	return b.client, nil
 }
 
+// RemoteWorkDir returns the configured working directory inside the sandbox.
+// This is where worktree files are synced and where the agent works.
+func (b *DaytonaBackend) RemoteWorkDir() string {
+	if b.config != nil && b.config.RemoteWorkDir != "" {
+		return b.config.RemoteWorkDir
+	}
+	return DefaultRemoteWorkDir
+}
+
 // Compile-time interface checks
 var (
 	_ Backend     = (*DaytonaBackend)(nil)

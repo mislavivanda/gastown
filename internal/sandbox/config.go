@@ -7,6 +7,10 @@ import (
 	"sync"
 )
 
+// DefaultRemoteWorkDir is the default working directory inside remote sandboxes.
+// This is where worktree files are synced and where agents work on code.
+const DefaultRemoteWorkDir = "/home/daytona/work"
+
 // Config represents sandbox backend configuration.
 // This can be specified at town level (settings/sandbox.json)
 // or rig level (rig/settings/sandbox.json).
@@ -65,6 +69,11 @@ type DaytonaConfig struct {
 	// Available values: "us", "eu"
 	// Default: "" (uses Daytona's default)
 	Target string `json:"target,omitempty"`
+
+	// RemoteWorkDir is the directory inside the sandbox where worktree files are synced.
+	// This is where the agent will find the project code to work on.
+	// Default: "/home/daytona/work"
+	RemoteWorkDir string `json:"remote_work_dir,omitempty"`
 }
 
 // LocalConfig contains local backend-specific settings.
@@ -91,6 +100,7 @@ func DefaultDaytonaConfig() *DaytonaConfig {
 		AutoStopMinutes:    15,
 		AutoArchiveMinutes: 10080, // 7 days
 		AutoDeleteMinutes:  -1,    // disabled
+		RemoteWorkDir:      DefaultRemoteWorkDir,
 	}
 }
 
