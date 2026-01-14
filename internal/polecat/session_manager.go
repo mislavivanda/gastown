@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/sandbox/daytona"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // debugSession logs non-fatal errors during session startup when GT_DEBUG_SESSION=1.
@@ -67,6 +68,42 @@ func NewSessionManagerWithBackend(t *tmux.Tmux, r *rig.Rig, backend sandbox.Back
 		backend:        backend,
 		activeSessions: make(map[string]*sandbox.Session),
 	}
+}
+
+// NewSessionManagerForRig creates a SessionManager with the appropriate backend for a rig.
+// This is a convenience function for callers that don't have a polecat.Manager instance.
+// It loads sandbox configuration from the rig and town settings.
+func NewSessionManagerForRig(r *rig.Rig, rigsConfig *config.RigsConfig) (*SessionManager, error) {
+	t := tmux.NewTmux()
+
+	// Try to load sandbox config from rig, fall back to town
+	townRoot, err := workspace.Find(r.Path)
+	if err != nil {
+		// On error, use local backend (default behavior)
+		return NewSessionManager(t, r), nil
+	}
+
+	// Load sandbox config
+	sandboxCfg, err := sandbox.LoadConfig(townRoot)
+	if err != nil {
+		// On error, use local backend (default behavior)
+		return NewSessionManager(t, r), nil
+	}
+
+	// Try to load rig-level overrides
+	rigCfg, _ := sandbox.LoadConfig(r.Path)
+	if rigCfg != nil {
+		sandboxCfg = sandbox.MergeConfigs(sandboxCfg, rigCfg)
+	}
+
+	// Get the backend for polecats
+	backend, err := sandbox.GetBackendForRole(sandboxCfg, "polecat")
+	if err != nil {
+		// If we can't get the configured backend, fall back to local
+		return NewSessionManager(t, r), nil
+	}
+
+	return NewSessionManagerWithBackend(t, r, backend), nil
 }
 
 // SetBackend sets the execution backend for this session manager.
@@ -184,6 +221,10 @@ type SessionStartOptions struct {
 	// Used by remote backends (Daytona) where beads are not accessible.
 	// If set, this is sent as the initial prompt instead of propulsion nudge.
 	TaskPrompt string
+
+	// HookBead is the bead ID that this polecat is working on.
+	// Stored in session metadata for retrieval during completion.
+	HookBead string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -458,9 +499,12 @@ func (m *SessionManager) startWithRemoteBackend(polecat string, opts SessionStar
 		fmt.Printf("✓ Worktree synced to sandbox\n")
 	}
 
-	// Store work dirs in session metadata for sync back later
+	// Store work dirs and hook bead in session metadata for sync back later
 	sandboxSession.Metadata["local_work_dir"] = localWorkDir
 	sandboxSession.Metadata["remote_work_dir"] = remoteWorkDir
+	if opts.HookBead != "" {
+		sandboxSession.Metadata["hook_bead"] = opts.HookBead
+	}
 
 	// Hook the issue to the polecat if provided
 	if opts.Issue != "" {
@@ -809,6 +853,12 @@ func (m *SessionManager) statusWithRemoteBackend(polecat string) (*SessionInfo, 
 
 // List returns information about all polecat sessions for this rig.
 func (m *SessionManager) List() ([]SessionInfo, error) {
+	// For remote backends, list from persisted session state directory
+	if m.IsRemoteBackend() {
+		return m.listRemoteSessions()
+	}
+
+	// For local backend, list from tmux sessions
 	sessions, err := m.tmux.ListSessions()
 	if err != nil {
 		return nil, err
@@ -828,6 +878,55 @@ func (m *SessionManager) List() ([]SessionInfo, error) {
 			SessionID: sessionID,
 			Running:   true,
 			RigName:   m.rig.Name,
+		})
+	}
+
+	return infos, nil
+}
+
+// listRemoteSessions lists polecat sessions from persisted state files.
+// Remote sessions are stored in {rig}/.runtime/daytona-sessions/{polecat}.json
+func (m *SessionManager) listRemoteSessions() ([]SessionInfo, error) {
+	sessionsDir := filepath.Join(m.rig.Path, ".runtime", "daytona-sessions")
+
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No sessions directory = no sessions
+		}
+		return nil, fmt.Errorf("reading sessions directory: %w", err)
+	}
+
+	var infos []SessionInfo
+	ctx := context.Background()
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		// Extract polecat name from filename (e.g., "Toast.json" -> "Toast")
+		polecatName := strings.TrimSuffix(entry.Name(), ".json")
+
+		// Load the session state to get details
+		state, err := m.loadSessionState(polecatName)
+		if err != nil {
+			continue // Skip invalid state files
+		}
+
+		// Check if session still exists in the backend
+		running := false
+		if m.backend != nil {
+			running, _ = m.backend.HasSession(ctx, state.SessionID)
+		}
+
+		infos = append(infos, SessionInfo{
+			Polecat:   polecatName,
+			SessionID: state.SessionID,
+			Running:   running,
+			RigName:   m.rig.Name,
+			Backend:   state.Backend,
+			Created:   state.CreatedAt,
 		})
 	}
 
@@ -1005,4 +1104,221 @@ func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 	}
 	fmt.Printf("✓ Hooked issue %s to %s\n", issueID, agentID)
 	return nil
+}
+
+// RemoteCompletionResult contains the result of checking remote polecat completion.
+type RemoteCompletionResult struct {
+	// Completed indicates the polecat has finished its task
+	Completed bool
+
+	// Reason describes why we determined the task is complete (or not)
+	Reason string
+
+	// Output is the captured output used for analysis (last N lines)
+	Output string
+}
+
+// TaskCompletedMarker is the exact string that agents output to signal task completion.
+// This is specified in the task prompt for remote polecats.
+const TaskCompletedMarker = "TASK_COMPLETED"
+
+// CheckRemoteCompletion checks if a remote polecat has completed its task.
+// The agent is instructed to output "TASK_COMPLETED" when done.
+// Returns a result indicating whether the task is complete.
+func (m *SessionManager) CheckRemoteCompletion(polecat string) (*RemoteCompletionResult, error) {
+	if !m.IsRemoteBackend() {
+		return nil, fmt.Errorf("CheckRemoteCompletion only works for remote backends")
+	}
+
+	// Capture recent output (last 200 lines should be enough to see completion marker)
+	output, err := m.captureRemote(polecat, 200)
+	if err != nil {
+		return nil, fmt.Errorf("capturing output: %w", err)
+	}
+
+	result := &RemoteCompletionResult{
+		Output: output,
+	}
+
+	// If output is empty or just "[No output log yet]", task hasn't started
+	if output == "" || strings.Contains(output, "[No output log yet]") {
+		result.Completed = false
+		result.Reason = "no output yet"
+		return result, nil
+	}
+
+	// Check for the explicit TASK_COMPLETED marker
+	if strings.Contains(output, TaskCompletedMarker) {
+		result.Completed = true
+		result.Reason = "found TASK_COMPLETED marker"
+		return result, nil
+	}
+
+	result.Completed = false
+	result.Reason = "TASK_COMPLETED marker not found"
+	return result, nil
+}
+
+// CompleteRemotePolecatResult contains the result of the completion protocol.
+type CompleteRemotePolecatResult struct {
+	// Success indicates the completion protocol succeeded
+	Success bool
+
+	// ChangesSynced indicates files were synced from sandbox
+	ChangesSynced bool
+
+	// BeadsSynced indicates bd sync was run
+	BeadsSynced bool
+
+	// BranchName is the git branch with changes (if any)
+	BranchName string
+
+	// Error contains any error that occurred
+	Error error
+}
+
+// CompleteRemotePolecat executes the completion protocol for a remote polecat.
+// This is called when completion is detected and handles:
+// 1. Syncing changes from sandbox back to local worktree
+// 2. Committing changes with git add + commit
+// 3. Running bd sync locally
+// 4. Stopping/destroying the sandbox
+//
+// Note: The MR submission and POLECAT_DONE notification should be handled
+// by the caller (daemon) after this method returns, since they require
+// access to the witness mail system and merge queue.
+func (m *SessionManager) CompleteRemotePolecat(polecat string) (*CompleteRemotePolecatResult, error) {
+	if !m.IsRemoteBackend() {
+		return nil, fmt.Errorf("CompleteRemotePolecat only works for remote backends")
+	}
+
+	result := &CompleteRemotePolecatResult{}
+	ctx := context.Background()
+
+	// Load persisted session state to get metadata
+	state, err := m.loadSessionState(polecat)
+	if err != nil {
+		result.Error = fmt.Errorf("loading session state: %w", err)
+		return result, result.Error
+	}
+
+	// Get tracked session or build from persisted state
+	sandboxSession, ok := m.activeSessions[polecat]
+	if !ok {
+		sandboxSession = &sandbox.Session{
+			ID:       state.SessionID,
+			Backend:  sandbox.BackendType(state.Backend),
+			Metadata: state.Metadata,
+		}
+	}
+
+	// Get work directories from session metadata
+	localWorkDir := sandboxSession.Metadata["local_work_dir"]
+	if localWorkDir == "" {
+		localWorkDir = m.polecatDir(polecat)
+	}
+	remoteWorkDir := sandboxSession.Metadata["remote_work_dir"]
+	if remoteWorkDir == "" {
+		remoteWorkDir = sandbox.DefaultRemoteWorkDir
+		if daytonaBackend, ok := m.backend.(*sandbox.DaytonaBackend); ok {
+			remoteWorkDir = daytonaBackend.RemoteWorkDir()
+		}
+	}
+
+	// Step 1: Sync changes from sandbox back to local worktree
+	if syncBackend, ok := m.backend.(sandbox.SyncBackend); ok {
+		fmt.Printf("Syncing changes from sandbox: %s -> %s\n", remoteWorkDir, localWorkDir)
+		if err := syncBackend.SyncFromSession(ctx, sandboxSession, remoteWorkDir, localWorkDir); err != nil {
+			fmt.Printf("Warning: failed to sync changes from sandbox: %v\n", err)
+		} else {
+			fmt.Printf("✓ Changes synced from sandbox\n")
+			result.ChangesSynced = true
+		}
+	}
+
+	// Step 2: Commit changes (git add + commit)
+	if result.ChangesSynced {
+		// Check if there are any changes to commit
+		statusCmd := exec.Command("git", "status", "--porcelain")
+		statusCmd.Dir = localWorkDir
+		if statusOut, err := statusCmd.Output(); err == nil && len(statusOut) > 0 {
+			// Stage all changes
+			addCmd := exec.Command("git", "add", ".")
+			addCmd.Dir = localWorkDir
+			if err := addCmd.Run(); err != nil {
+				fmt.Printf("Warning: git add failed: %v\n", err)
+			} else {
+				// Get issue ID from session metadata if available
+				issueID := sandboxSession.Metadata["issue_id"]
+				commitMsg := "Remote polecat work"
+				if issueID != "" {
+					commitMsg = fmt.Sprintf("Remote polecat work (%s)", issueID)
+				}
+
+				// Commit the changes
+				commitCmd := exec.Command("git", "commit", "-m", commitMsg)
+				commitCmd.Dir = localWorkDir
+				if err := commitCmd.Run(); err != nil {
+					fmt.Printf("Warning: git commit failed: %v\n", err)
+				} else {
+					fmt.Printf("✓ Changes committed: %s\n", commitMsg)
+				}
+			}
+		}
+	}
+
+	// Step 3: Run bd sync locally to update beads
+	if err := m.syncBeads(localWorkDir); err != nil {
+		fmt.Printf("Warning: beads sync failed: %v\n", err)
+	} else {
+		result.BeadsSynced = true
+	}
+
+	// Step 4: Get the branch name for MR submission
+	gitCmd := exec.Command("git", "branch", "--show-current")
+	gitCmd.Dir = localWorkDir
+	if branchOut, err := gitCmd.Output(); err == nil {
+		result.BranchName = strings.TrimSpace(string(branchOut))
+	}
+
+	// Step 5: Destroy the sandbox (this also cleans up PTY and session state)
+	if err := m.backend.Destroy(ctx, sandboxSession); err != nil {
+		result.Error = fmt.Errorf("destroying sandbox: %w", err)
+		return result, result.Error
+	}
+
+	// Remove from tracking and clean up persisted state
+	delete(m.activeSessions, polecat)
+	_ = m.deleteSessionState(polecat)
+
+	result.Success = true
+	return result, nil
+}
+
+// GetLocalWorkDir returns the local working directory for a polecat.
+// This is useful for callers that need to run commands in the polecat's worktree.
+func (m *SessionManager) GetLocalWorkDir(polecat string) string {
+	// Try to get from session metadata first (for remote sessions)
+	if m.IsRemoteBackend() {
+		if state, err := m.loadSessionState(polecat); err == nil {
+			if localDir := state.Metadata["local_work_dir"]; localDir != "" {
+				return localDir
+			}
+		}
+	}
+	// Fall back to standard polecat directory
+	return m.polecatDir(polecat)
+}
+
+// GetHookBead returns the hook bead ID for a remote polecat.
+// Returns empty string if not found or not a remote backend.
+func (m *SessionManager) GetHookBead(polecat string) string {
+	if !m.IsRemoteBackend() {
+		return ""
+	}
+	state, err := m.loadSessionState(polecat)
+	if err != nil {
+		return ""
+	}
+	return state.Metadata["hook_bead"]
 }

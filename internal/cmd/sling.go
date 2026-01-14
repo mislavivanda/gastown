@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/sandbox"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -562,7 +563,7 @@ func buildTaskPromptForRemote(beadID string, info *beadInfo, args string) string
 	}
 
 	sb.WriteString("\n\n---\n")
-	sb.WriteString("Complete this task. When done, summarize what you accomplished.\n\n")
+	fmt.Fprintf(&sb, "Complete this task. When done, summarize what you accomplished and output `%s` on its own line to signal completion.\n\n", polecat.TaskCompletedMarker)
 	sb.WriteString("**Environment:**\n")
 	fmt.Fprintf(&sb, "- You are running in a remote sandbox\n")
 	fmt.Fprintf(&sb, "- The project code has been synced to `%s` - work inside this directory\n", remoteWorkDir)
